@@ -7,12 +7,26 @@ import shutil
 from subprocess import Popen, PIPE
 import sys
 import tempfile
-
+import zmq
+from zmq.eventloop import ioloop
+from zmq.eventloop.zmqstream import ZMQStream
 from .hashindex import NSIndex
 from .helpers import Error, IntegrityError
 from .repository import Repository
 
 BUFSIZE = 10 * 1024 * 1024
+
+
+def is_poll_in(sock, poller, timeout=100):
+    """
+    Check whether a poller detects incoming data on a specified
+    socket.
+    """
+    socks = dict(poller.poll(timeout))
+    if sock in socks and socks[sock] == zmq.POLLIN:
+        return True
+    else:
+        return False
 
 
 class ConnectionClosed(Error):
@@ -23,61 +37,104 @@ class PathNotAllowed(Error):
     """Repository path not allowed"""
 
 
+#This class is the open pipe in the server.
 class RepositoryServer(object):
 
-    def __init__(self, restrict_to_paths):
+    def __init__(self, restrict_to_paths ):
+        self.s = None
         self.repository = None
         self.restrict_to_paths = restrict_to_paths
+        ioloop.install()
+        self.context = zmq.Context()        
 
-    def serve(self):
-        # Make stdin non-blocking
-        fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
-        fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, fl | os.O_NONBLOCK)
-        # Make stdout blocking
-        fl = fcntl.fcntl(sys.stdout.fileno(), fcntl.F_GETFL)
-        fcntl.fcntl(sys.stdout.fileno(), fcntl.F_SETFL, fl & ~os.O_NONBLOCK)
+    def serve(self,port=5000):
         unpacker = msgpack.Unpacker(use_list=False)
-        while True:
-            r, w, es = select.select([sys.stdin], [], [], 10)
-            if r:
-                data = os.read(sys.stdin.fileno(), BUFSIZE)
+        #restrict_to_paths = self.restrict_to_paths
+        s = None
+        self.thread_list = None
+        socket = self.context.socket(zmq.REP)
+        #self.s.setsockopt(zmq.RCVBUF,BUFSIZE)
+        #self.s.setsockopt(zmq.SNDBUF,BUFSIZE)
+        socket.bind("tcp://*:%s" % port)
+        s = ZMQStream(socket)
+        def echo(data_list):
+            #data = self.s.recv()
+            for data in data_list:
                 if not data:
                     return
-                unpacker.feed(data)
+                print (data)
+                unpacker.feed(data)            
                 for type, msgid, method, args in unpacker:
                     method = method.decode('ascii')
+                    print ("method: " + str(method))
+                    print ("ID:" + str(msgid))
+
+
                     try:
                         try:
                             f = getattr(self, method)
                         except AttributeError:
+                            #self.thread_list[args[0]] es el hilo donde estan los datos
                             f = getattr(self.repository, method)
                         res = f(*args)
                     except Exception as e:
-                        sys.stdout.buffer.write(msgpack.packb((1, msgid, e.__class__.__name__, e.args)))
+                        s.send(msgpack.packb((1, msgid, e.__class__.__name__, e.args)))
                     else:
-                        sys.stdout.buffer.write(msgpack.packb((1, msgid, None, res)))
-                    sys.stdout.flush()
-            if es:
-                return
+                        s.send(msgpack.packb((1, msgid, None, res)))
+                #sys.stdout.flush()
+
+        s.on_recv(echo,copy=True)
+        ioloop.IOLoop.instance().start()
+
+    def getcommand (context,restrict_to_paths,path,create):
+        unpacker = msgpack.Unpacker(use_list=False)
+        path = os.fsdecode(path)
+        if path.startswith('/~'):
+            path = path[1:]
+        path = os.path.realpath(os.path.expanduser(path))
+        if restrict_to_paths:
+            for restrict_to_path in restrict_to_paths:
+                if path.startswith(os.path.realpath(restrict_to_path)):
+                    break
+            else:
+                raise PathNotAllowed(path)
+        repository = Repository(path, create)
+        socket = context.socket(zmq.REQ)
+        #self.s.setsockopt(zmq.RCVBUF,BUFSIZE)
+        #self.s.setsockopt(zmq.SNDBUF,BUFSIZE)
+        socket.bind("inproc://%s" % repository.id)
+        s = ZMQStream(socket)
+        def echo(data_list):
+            for data in data_list:
+                unpacker.feed(data)            
+                for type, msgid, method, args in unpacker:            
+                    try:
+                        f = getattr(self, method)
+                        res = f(*args)
+                    except Exception as e:
+                        s.send(msgpack.packb((repository.id, msgid, e.__class__.__name__, e.args)))
+                    else:
+                        s.send(msgpack.packb((repository.id, msgid, None, res)))
+        s.on_recv(echo,copy=True)
+        ioloop.IOLoop.instance().start()
 
     def negotiate(self, versions):
         return 1
 
     def open(self, path, create=False):
-        path = os.fsdecode(path)
-        if path.startswith('/~'):
-            path = path[1:]
-        path = os.path.realpath(os.path.expanduser(path))
-        if self.restrict_to_paths:
-            for restrict_to_path in self.restrict_to_paths:
-                if path.startswith(os.path.realpath(restrict_to_path)):
-                    break
-            else:
-                raise PathNotAllowed(path)
-        self.repository = Repository(path, create)
-        return self.repository.id
+        #Creamos el nuevo hilo los mensajes los servira el objeto repository
+        Process(target=getcommand, args=(self.context,self.restrict_to_paths,path,create,)).start()
+        #nos conectamos y obtenemos el repo.id
+        socket=self.context.socket(zmq.REP)
+        socket.send(msgpack.packb((0, 1, "id", ())))
+        data_list=socket.recv()
+        for data in data_list:
+            unpacker.feed(data)            
+            for type, msgid, method, args in unpacker:        
+                return type
 
 
+#This class is the connection in the client to the server.
 class RemoteRepository(object):
     extra_test_args = []
 
@@ -95,25 +152,35 @@ class RemoteRepository(object):
         self.ignore_responses = set()
         self.responses = {}
         self.unpacker = msgpack.Unpacker(use_list=False)
+        self.s = None
         self.p = None
-        if location.host == '__testsuite__':
-            args = [sys.executable, '-m', 'attic.archiver', 'serve'] + self.extra_test_args
-        else:
-            args = ['ssh']
-            if location.port:
-                args += ['-p', str(location.port)]
-            if location.user:
-                args.append('%s@%s' % (location.user, location.host))
-            else:
-                args.append('%s' % location.host)
-            args += ['attic', 'serve']
-        self.p = Popen(args, bufsize=0, stdin=PIPE, stdout=PIPE)
-        self.stdin_fd = self.p.stdin.fileno()
-        self.stdout_fd = self.p.stdout.fileno()
-        fcntl.fcntl(self.stdin_fd, fcntl.F_SETFL, fcntl.fcntl(self.stdin_fd, fcntl.F_GETFL) | os.O_NONBLOCK)
-        fcntl.fcntl(self.stdout_fd, fcntl.F_SETFL, fcntl.fcntl(self.stdout_fd, fcntl.F_GETFL) | os.O_NONBLOCK)
-        self.r_fds = [self.stdout_fd]
-        self.x_fds = [self.stdin_fd, self.stdout_fd]
+        context = zmq.Context()
+        self.s = context.socket(zmq.REQ)
+        #self.s.setsockopt(zmq.RCVBUF,BUFSIZE)
+        #self.s.setsockopt(zmq.SNDBUF,BUFSIZE)
+        #first try no auth no encription
+        self.s.connect("tcp://%s:%d" % (location.host, location.port))
+        self.poll = zmq.Poller()
+        self.poll.register(self.s, zmq.POLLIN)
+
+        # if location.host == '__testsuite__':
+        #     args = [sys.executable, '-m', 'attic.archiver', 'serve'] + self.extra_test_args
+        # else:
+        #     args = self.location.ssh_command
+        #     if location.port:
+        #         args += ['-p', str(location.port)]
+        #     if location.user:
+        #         args.append('%s@%s' % (location.user, location.host))
+        #     else:
+        #         args.append('%s' % location.host)
+        #     args += ['attic', 'serve']
+        # self.p = Popen(args, bufsize=0, stdin=PIPE, stdout=PIPE)
+        # self.stdin_fd = self.p.stdin.fileno()
+        # self.stdout_fd = self.p.stdout.fileno()
+        # fcntl.fcntl(self.stdin_fd, fcntl.F_SETFL, fcntl.fcntl(self.stdin_fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+        # fcntl.fcntl(self.stdout_fd, fcntl.F_SETFL, fcntl.fcntl(self.stdout_fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+        # self.r_fds = [self.stdout_fd]
+        # self.x_fds = [self.stdin_fd, self.stdout_fd]
 
         version = self.call('negotiate', 1)
         if version != 1:
@@ -138,10 +205,12 @@ class RemoteRepository(object):
 
         calls = list(calls)
         waiting_for = []
-        w_fds = [self.stdin_fd]
+        #Used to force Client/server pattern in ZMQ
+        w_fds = True
         while wait or calls:
             while waiting_for:
                 try:
+                    print (self.responses)
                     error, res = self.responses.pop(waiting_for[0])
                     waiting_for.pop(0)
                     if error:
@@ -164,11 +233,12 @@ class RemoteRepository(object):
                             return
                 except KeyError:
                     break
-            r, w, x = select.select(self.r_fds, w_fds, self.x_fds, 1)
-            if x:
-                raise Exception('FD exception occured')
-            if r:
-                data = os.read(self.stdout_fd, BUFSIZE)
+            #r, w, x = select.select(self.r_fds, w_fds, self.x_fds, 1)
+            #if x:
+            #    raise Exception('FD exception occured')
+            if is_poll_in(self.s, self.poll):
+                data = self.s.recv()    #os.read(self.stdout_fd, BUFSIZE)
+                w_fds=True
                 if not data:
                     raise ConnectionClosed()
                 self.unpacker.feed(data)
@@ -177,7 +247,7 @@ class RemoteRepository(object):
                         self.ignore_responses.remove(msgid)
                     else:
                         self.responses[msgid] = error, res
-            if w:
+            if w_fds:
                 while not self.to_send and (calls or self.preload_ids) and len(waiting_for) < 100:
                     if calls:
                         if is_preloaded:
@@ -199,14 +269,17 @@ class RemoteRepository(object):
 
                 if self.to_send:
                     try:
-                        self.to_send = self.to_send[os.write(self.stdin_fd, self.to_send):]
+                        msize = len(self.to_send)
+                        print (self.to_send) 
+                        self.s.send(self.to_send)
+                        self.to_send = self.to_send[msize:]
                     except OSError as e:
                         # io.write might raise EAGAIN even though select indicates
                         # that the fd should be writable
                         if e.errno != errno.EAGAIN:
                             raise
                 if not self.to_send and not (calls or self.preload_ids):
-                    w_fds = []
+                    w_fds = False
         self.ignore_responses |= set(waiting_for)
 
     def check(self, repair=False):
@@ -239,11 +312,7 @@ class RemoteRepository(object):
         return self.call('delete', id_, wait=wait)
 
     def close(self):
-        if self.p:
-            self.p.stdin.close()
-            self.p.stdout.close()
-            self.p.wait()
-            self.p = None
+        self.s.close()
 
     def preload(self, ids):
         self.preload_ids += ids
